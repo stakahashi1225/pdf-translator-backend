@@ -1,27 +1,28 @@
 """
-PDF Translator Backend
-======================
+PDF Translator Backend — Optimized for Render deployment
+=========================================================
 Requirements:
-    py -m pip install pymupdf fastapi uvicorn python-multipart httpx pdfminer.six deep-translator
+    pip install pymupdf fastapi uvicorn python-multipart deep-translator
 
-Usage:
-    py -m uvicorn main:app --reload --port 8000
+Usage (local):
+    uvicorn main:app --port 8000
 """
 
 import io
-import time
-import httpx
+import fitz  # PyMuPDF
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-import fitz  # PyMuPDF
 from deep_translator import GoogleTranslator
 
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextBox, LTTextLine, LTAnon, LTChar
-
 app = FastAPI(title="PDF Translator")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 LANG_MAP = {
     "japanese": "ja",
@@ -31,116 +32,124 @@ LANG_MAP = {
 }
 
 
-# ── Text extraction ───────────────────────────────────────────────────────────
+# ── Fast text extraction using PyMuPDF rawdict ────────────────────────────────
 
-def extract_blocks_pdfminer(pdf_bytes: bytes) -> list[list[dict]]:
+def extract_blocks(pdf_bytes: bytes) -> list[list[dict]]:
+    """
+    Extract text blocks per page using PyMuPDF rawdict mode.
+    rawdict reads character-level Unicode — handles CJK fonts correctly.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_pages = []
-    try:
-        for page_layout in extract_pages(io.BytesIO(pdf_bytes)):
-            page_blocks = []
-            page_height = page_layout.height
-            for element in page_layout:
-                if not isinstance(element, LTTextBox):
-                    continue
-                full_text = ""
-                for line in element:
-                    if isinstance(line, LTTextLine):
-                        line_text = "".join(
-                            ch.get_text() for ch in line
-                            if isinstance(ch, (LTChar, LTAnon))
-                        ).strip()
-                        if line_text:
-                            full_text += line_text + "\n"
-                full_text = full_text.strip()
-                if not full_text:
-                    continue
-                x0, y0_pdf, x1, y1_pdf = element.bbox
-                page_blocks.append({
-                    "text": full_text,
-                    "x0": x0,
-                    "y0": page_height - y1_pdf,
-                    "x1": x1,
-                    "y1": page_height - y0_pdf,
-                })
-            all_pages.append(page_blocks)
-    except Exception as e:
-        print(f"pdfminer error: {e}")
+
+    for page in doc:
+        page_blocks = []
+        raw = page.get_text("rawdict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+
+        for block in raw.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+
+            chars_text = ""
+            for line in block.get("lines", []):
+                line_str = ""
+                for span in line.get("spans", []):
+                    for ch in span.get("chars", []):
+                        c = ch.get("c", "")
+                        if c:
+                            line_str += c
+                if line_str.strip():
+                    chars_text += line_str.strip() + "\n"
+
+            chars_text = chars_text.strip()
+            if not chars_text:
+                continue
+
+            x0, y0, x1, y1 = block["bbox"]
+            page_blocks.append({
+                "text": chars_text,
+                "x0": x0, "y0": y0,
+                "x1": x1, "y1": y1,
+            })
+
+        all_pages.append(page_blocks)
+
+    doc.close()
     return all_pages
 
 
-# ── Translation (deep-translator → Google Translate, fast & free) ─────────────
+# ── Fast batch translation via Google Translate ───────────────────────────────
 
 def translate_all(texts: list[str], src_lang: str) -> list[str]:
     """
-    Translate all texts in one batch using deep-translator (Google Translate).
-    Splits into chunks of 5000 chars max per request.
-    Much faster than MyMemory — no per-block delays.
+    Batch all text into as few Google Translate calls as possible.
+    Uses a separator trick so we can join + split in one round trip.
+    Typical time: 1-3 seconds for an entire document.
     """
     if not texts:
         return []
 
-    translator = GoogleTranslator(source=src_lang, target="en")
-    results = [""] * len(texts)
+    SEP = "\n§§§\n"
+    MAX_CHARS = 4000
+    results = list(texts)  # default to originals
 
-    # Batch texts together with a separator to minimize API calls
-    SEPARATOR = "\n||||\n"
-    MAX_CHARS = 4500
+    try:
+        translator = GoogleTranslator(source=src_lang, target="en")
+    except Exception as e:
+        print(f"Translator init error: {e}")
+        return results
 
-    # Group texts into batches
-    batch = []
-    batch_indices = []
-    batch_len = 0
+    # Build batches
+    batches = []       # list of (joined_text, [original_indices])
+    current_texts = []
+    current_indices = []
+    current_len = 0
 
-    def flush_batch():
-        if not batch:
-            return
-        joined = SEPARATOR.join(batch)
+    for i, text in enumerate(texts):
+        t = text.strip()
+        if not t:
+            continue
+        if current_len + len(t) > MAX_CHARS and current_texts:
+            batches.append((SEP.join(current_texts), current_indices[:]))
+            current_texts.clear()
+            current_indices.clear()
+            current_len = 0
+        current_texts.append(t)
+        current_indices.append(i)
+        current_len += len(t) + len(SEP)
+
+    if current_texts:
+        batches.append((SEP.join(current_texts), current_indices[:]))
+
+    print(f"  Translating {len(texts)} blocks in {len(batches)} batch(es)...")
+
+    for joined, indices in batches:
         try:
             translated = translator.translate(joined)
-            if translated:
-                parts = translated.split("||||")
-                for i, part in enumerate(parts):
-                    if i < len(batch_indices):
-                        results[batch_indices[i]] = part.strip()
-            else:
-                # fallback: copy original
-                for i in batch_indices:
-                    results[i] = texts[i]
+            if not translated:
+                continue
+            # Split back — Google sometimes merges/drops separators so we do a best-effort split
+            parts = translated.split("§§§")
+            parts = [p.strip() for p in parts if p.strip()]
+            for i, part in enumerate(parts):
+                if i < len(indices):
+                    results[indices[i]] = part
         except Exception as e:
-            print(f"Batch translation error: {e}")
-            for i in batch_indices:
-                results[i] = texts[i]
+            print(f"  Batch error: {e}")
 
-    for idx, text in enumerate(texts):
-        text = text.strip()
-        if not text:
-            results[idx] = ""
-            continue
-
-        if batch_len + len(text) > MAX_CHARS and batch:
-            flush_batch()
-            batch.clear()
-            batch_indices.clear()
-            batch_len = 0
-
-        batch.append(text)
-        batch_indices.append(idx)
-        batch_len += len(text) + len(SEPARATOR)
-
-    flush_batch()
-
-    print(f"  Translated {len(texts)} blocks via Google Translate")
     return results
 
 
-# ── PDF rendering ─────────────────────────────────────────────────────────────
+# ── Build translated PDF ──────────────────────────────────────────────────────
 
 def build_translated_pdf(original_bytes: bytes, all_page_data: list[list[dict]]) -> bytes:
     doc = fitz.open(stream=original_bytes, filetype="pdf")
+
     for page_idx, blocks in enumerate(all_page_data):
         if page_idx >= len(doc):
             break
         page = doc[page_idx]
+
         for block in blocks:
             translated = block.get("translated_text", "").strip()
             if not translated:
@@ -150,33 +159,34 @@ def build_translated_pdf(original_bytes: bytes, all_page_data: list[list[dict]])
                 continue
             page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
             fontsize = max(6, min(rect.height * 0.72, 10))
-            page.insert_textbox(rect, translated, fontsize=fontsize,
-                                fontname="helv", color=(0, 0, 0), align=0)
+            page.insert_textbox(
+                rect, translated,
+                fontsize=fontsize, fontname="helv",
+                color=(0, 0, 0), align=0,
+            )
+
     buf = io.BytesIO()
     doc.save(buf)
     doc.close()
     return buf.getvalue()
 
 
-# ── Shared processing ─────────────────────────────────────────────────────────
+# ── Shared pipeline ───────────────────────────────────────────────────────────
 
-async def process_pdf(file: UploadFile, source_lang: str):
+async def run_pipeline(file: UploadFile, source_lang: str):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="File must be a PDF.")
 
     pdf_bytes = await file.read()
     src_lang = LANG_MAP.get(source_lang.lower(), "auto")
 
-    print(f"Extracting text...")
-    all_page_blocks = extract_blocks_pdfminer(pdf_bytes)
+    all_page_blocks = extract_blocks(pdf_bytes)
 
     if not all_page_blocks or not any(all_page_blocks):
         raise HTTPException(status_code=400,
-            detail="No text found. If scanned, run OCR first at ilovepdf.com/ocr-pdf")
+            detail="No text found. If this is a scanned PDF, run OCR first at ilovepdf.com/ocr-pdf")
 
     all_texts = [b["text"] for page in all_page_blocks for b in page]
-    print(f"Translating {len(all_texts)} blocks in batch...")
-
     translated_flat = translate_all(all_texts, src_lang)
 
     idx = 0
@@ -190,34 +200,36 @@ async def process_pdf(file: UploadFile, source_lang: str):
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.get("/")
+def root():
+    return {"status": "PDF Translator API is running"}
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "translator": "Google Translate (deep-translator)"}
-
+    return {"status": "ok"}
 
 @app.post("/preview")
 async def preview_pdf(
     file: UploadFile = File(...),
     source_lang: str = Form("japanese"),
 ):
-    pdf_bytes, all_page_blocks = await process_pdf(file, source_lang)
+    pdf_bytes, all_page_blocks = await run_pipeline(file, source_lang)
     result_pages = []
     for page_blocks in all_page_blocks:
         result_pages.append([{
-            "original": b["text"],
+            "original":   b["text"],
             "translated": b["translated_text"],
             "x0": b["x0"], "y0": b["y0"],
             "x1": b["x1"], "y1": b["y1"],
         } for b in page_blocks])
     return JSONResponse({"pages": result_pages})
 
-
 @app.post("/translate")
 async def translate_pdf(
     file: UploadFile = File(...),
     source_lang: str = Form("japanese"),
 ):
-    pdf_bytes, all_page_blocks = await process_pdf(file, source_lang)
+    pdf_bytes, all_page_blocks = await run_pipeline(file, source_lang)
     translated_pdf = build_translated_pdf(pdf_bytes, all_page_blocks)
     filename = file.filename.replace(".pdf", "_translated.pdf")
     return StreamingResponse(
