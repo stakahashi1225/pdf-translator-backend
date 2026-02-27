@@ -62,29 +62,20 @@ def ocr_page(image_bytes: bytes, lang_hint: str, scale_x: float, scale_y: float)
     blocks = []
     for pg in ann.get("pages", []):
         for block in pg.get("blocks", []):
-            verts = block.get("boundingBox", {}).get("vertices", [])
-            if len(verts) < 4:
-                continue
-
-            text = ""
             for para in block.get("paragraphs", []):
+                verts = para.get("boundingBox", {}).get("vertices", [])
+                if len(verts) < 4:
+                    continue
+                text = ""
                 for word in para.get("words", []):
                     text += "".join(s.get("text", "") for s in word.get("symbols", []))
                     text += " "
-            text = text.strip()
-            if not text:
-                continue
-
-            # Convert image pixel coords → PDF points using scale factors
-            xs = [v.get("x", 0) * scale_x for v in verts]
-            ys = [v.get("y", 0) * scale_y for v in verts]
-
-            blocks.append({
-                "text": text,
-                "x0": min(xs), "y0": min(ys),
-                "x1": max(xs), "y1": max(ys),
-            })
-
+                text = text.strip()
+                if not text:
+                    continue
+                xs = [v.get("x", 0) * scale_x for v in verts]
+                ys = [v.get("y", 0) * scale_y for v in verts]
+                blocks.append({"text": text, "x0": min(xs), "y0": min(ys), "x1": max(xs), "y1": max(ys)})
     print(f"    Vision found {len(blocks)} blocks")
     return blocks
 
