@@ -1,6 +1,7 @@
 """
-PDF Translator Backend — Google Vision OCR + Google Translate
-=============================================================
+PDF Translator Backend — Google Vision OCR + Overlay Translation
+================================================================
+Keeps original Japanese text, adds blue English translation above each block.
 Requirements:
     pip install pymupdf fastapi uvicorn python-multipart deep-translator requests
 """
@@ -9,7 +10,7 @@ import io
 import os
 import base64
 import requests
-import fitz  # PyMuPDF
+import fitz
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -34,23 +35,22 @@ LANG_MAP = {
 }
 
 DPI = 200
-SCALE = 72.0 / DPI  # pixels → PDF points
+PX_TO_PT = 72.0 / DPI
 
 
-# ── Convert PDF page to image ─────────────────────────────────────────────────
+# ── Render PDF page to image ──────────────────────────────────────────────────
 
-def pdf_page_to_image(page: fitz.Page) -> bytes:
+def page_to_image(page: fitz.Page) -> tuple[bytes, int, int]:
     mat = fitz.Matrix(DPI / 72, DPI / 72)
     pix = page.get_pixmap(matrix=mat)
-    return pix.tobytes("png")
+    return pix.tobytes("png"), pix.width, pix.height
 
 
 # ── Google Vision OCR ─────────────────────────────────────────────────────────
 
 def ocr_image(image_bytes: bytes, lang_hint: str = "ja") -> list[dict]:
     if not VISION_API_KEY:
-        raise HTTPException(status_code=500,
-            detail="GOOGLE_VISION_API_KEY not set.")
+        raise HTTPException(status_code=500, detail="GOOGLE_VISION_API_KEY not set.")
 
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     payload = {
@@ -61,11 +61,7 @@ def ocr_image(image_bytes: bytes, lang_hint: str = "ja") -> list[dict]:
         }]
     }
 
-    resp = requests.post(
-        f"{VISION_URL}?key={VISION_API_KEY}",
-        json=payload, timeout=30,
-    )
-
+    resp = requests.post(f"{VISION_URL}?key={VISION_API_KEY}", json=payload, timeout=30)
     if resp.status_code != 200:
         raise HTTPException(status_code=502,
             detail=f"Google Vision error: {resp.status_code} {resp.text}")
@@ -81,15 +77,14 @@ def ocr_image(image_bytes: bytes, lang_hint: str = "ja") -> list[dict]:
         return []
 
     blocks = []
-    for page in full_annotation.get("pages", []):
-        for block in page.get("blocks", []):
+    for pg in full_annotation.get("pages", []):
+        for block in pg.get("blocks", []):
             for para in block.get("paragraphs", []):
                 para_text = ""
                 for word in para.get("words", []):
                     para_text += "".join(
                         s.get("text", "") for s in word.get("symbols", [])
                     )
-
                 para_text = para_text.strip()
                 if not para_text:
                     continue
@@ -101,13 +96,13 @@ def ocr_image(image_bytes: bytes, lang_hint: str = "ja") -> list[dict]:
                 xs = [v.get("x", 0) for v in verts]
                 ys = [v.get("y", 0) for v in verts]
 
-                # Convert pixel coords → PDF points
+                # Convert pixels → PDF points
                 blocks.append({
-                    "text":  para_text,
-                    "x0":    min(xs) * SCALE,
-                    "y0":    min(ys) * SCALE,
-                    "x1":    max(xs) * SCALE,
-                    "y1":    max(ys) * SCALE,
+                    "text": para_text,
+                    "x0": min(xs) * PX_TO_PT,
+                    "y0": min(ys) * PX_TO_PT,
+                    "x1": max(xs) * PX_TO_PT,
+                    "y1": max(ys) * PX_TO_PT,
                 })
 
     return blocks
@@ -162,43 +157,77 @@ def translate_all(texts: list[str], src_lang: str) -> list[str]:
     return results
 
 
-# ── Build translated PDF ──────────────────────────────────────────────────────
+# ── Build overlay PDF ─────────────────────────────────────────────────────────
 
-def build_translated_pdf(original_bytes: bytes, all_page_data: list[list[dict]]) -> bytes:
-    doc = fitz.open(stream=original_bytes, filetype="pdf")
+def build_overlay_pdf(
+    original_bytes: bytes,
+    all_page_data: list[list[dict]],
+) -> bytes:
+    """
+    Creates a new PDF where each page is expanded vertically to make room,
+    with original page as image on top and English translations overlaid
+    as blue text directly on top of each Japanese block.
+    
+    Strategy: render original as image, then draw blue translation text
+    ON TOP of each block position — Japanese stays visible underneath,
+    English appears as a semi-transparent blue overlay.
+    """
+    orig_doc = fitz.open(stream=original_bytes, filetype="pdf")
+    new_doc = fitz.open()
 
     for page_idx, blocks in enumerate(all_page_data):
-        if page_idx >= len(doc):
-            break
-        page = doc[page_idx]
+        orig_page = orig_doc[page_idx]
+        orig_w = orig_page.rect.width
+        orig_h = orig_page.rect.height
 
+        # Create new page same size as original
+        new_page = new_doc.new_page(width=orig_w, height=orig_h)
+
+        # Step 1: render original page as background image (preserves all original content)
+        img_bytes, img_w, img_h = page_to_image(orig_page)
+        new_page.insert_image(fitz.Rect(0, 0, orig_w, orig_h), stream=img_bytes)
+
+        # Step 2: overlay blue English translations on top
         for block in blocks:
             translated = block.get("translated_text", "").strip()
             if not translated:
                 continue
 
-            rect = fitz.Rect(block["x0"], block["y0"], block["x1"], block["y1"])
+            x0, y0, x1, y1 = block["x0"], block["y0"], block["x1"], block["y1"]
 
-            # Skip tiny or invalid rects
-            if rect.width < 4 or rect.height < 4 or rect.is_empty or rect.is_infinite:
+            # Clamp to page
+            x0 = max(0, min(x0, orig_w - 2))
+            x1 = max(x0 + 2, min(x1, orig_w))
+            y0 = max(0, min(y0, orig_h - 2))
+            y1 = max(y0 + 2, min(y1, orig_h))
+
+            rect = fitz.Rect(x0, y0, x1, y1)
+            if rect.width < 4 or rect.height < 4 or rect.is_empty:
                 continue
 
-            # White out original text
-            page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1))
+            # Semi-transparent white background so English is readable
+            new_page.draw_rect(
+                rect,
+                color=(1, 1, 1),
+                fill=(1, 1, 1),
+                fill_opacity=0.75,
+            )
 
-            # Fit font size to box height
-            fontsize = max(5, min(rect.height * 0.65, 11))
-            page.insert_textbox(
-                rect, translated,
+            # Blue English text on top
+            fontsize = max(5, min(rect.height * 0.70, 10))
+            new_page.insert_textbox(
+                rect,
+                translated,
                 fontsize=fontsize,
                 fontname="helv",
-                color=(0.1, 0.1, 0.6),  # dark blue so it's easy to spot
+                color=(0.0, 0.2, 0.8),  # blue
                 align=0,
             )
 
+    orig_doc.close()
     buf = io.BytesIO()
-    doc.save(buf)
-    doc.close()
+    new_doc.save(buf)
+    new_doc.close()
     return buf.getvalue()
 
 
@@ -215,13 +244,13 @@ async def run_pipeline(file: UploadFile, source_lang: str):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_page_blocks = []
 
-    print(f"Processing {doc.page_count} page(s) with Google Vision OCR...")
+    print(f"Processing {doc.page_count} page(s)...")
 
     for page_num in range(doc.page_count):
         page = doc[page_num]
-        img_bytes = pdf_page_to_image(page)
+        img_bytes, img_w, img_h = page_to_image(page)
         blocks = ocr_image(img_bytes, lang_hint)
-        print(f"  Page {page_num+1}: {len(blocks)} blocks, page size {page.rect.width:.0f}x{page.rect.height:.0f}pt")
+        print(f"  Page {page_num+1}: {len(blocks)} blocks found")
         all_page_blocks.append(blocks)
 
     doc.close()
@@ -273,9 +302,9 @@ async def translate_pdf(
     source_lang: str = Form("japanese"),
 ):
     pdf_bytes, all_page_blocks = await run_pipeline(file, source_lang)
-    translated_pdf = build_translated_pdf(pdf_bytes, all_page_blocks)
+    output_pdf = build_overlay_pdf(pdf_bytes, all_page_blocks)
     filename = file.filename.replace(".pdf", "_translated.pdf")
     return StreamingResponse(
-        io.BytesIO(translated_pdf), media_type="application/pdf",
+        io.BytesIO(output_pdf), media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
