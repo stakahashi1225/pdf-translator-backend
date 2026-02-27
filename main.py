@@ -1,7 +1,6 @@
 """
 PDF Translator Backend — Google Vision OCR + Overlay Translation
 ================================================================
-Keeps original Japanese text, adds blue English translation above each block.
 Requirements:
     pip install pymupdf fastapi uvicorn python-multipart deep-translator requests
 """
@@ -79,32 +78,35 @@ def ocr_image(image_bytes: bytes, lang_hint: str = "ja") -> list[dict]:
     blocks = []
     for pg in full_annotation.get("pages", []):
         for block in pg.get("blocks", []):
+            # Extract text and bbox at BLOCK level for maximum coverage
+            block_verts = block.get("boundingBox", {}).get("vertices", [])
+            if len(block_verts) < 4:
+                continue
+
+            block_text = ""
             for para in block.get("paragraphs", []):
-                para_text = ""
                 for word in para.get("words", []):
-                    para_text += "".join(
+                    word_text = "".join(
                         s.get("text", "") for s in word.get("symbols", [])
                     )
-                para_text = para_text.strip()
-                if not para_text:
-                    continue
+                    block_text += word_text + " "
 
-                verts = para.get("boundingBox", {}).get("vertices", [])
-                if len(verts) < 4:
-                    continue
+            block_text = block_text.strip()
+            if not block_text:
+                continue
 
-                xs = [v.get("x", 0) for v in verts]
-                ys = [v.get("y", 0) for v in verts]
+            xs = [v.get("x", 0) for v in block_verts]
+            ys = [v.get("y", 0) for v in block_verts]
 
-                # Convert pixels → PDF points
-                blocks.append({
-                    "text": para_text,
-                    "x0": min(xs) * PX_TO_PT,
-                    "y0": min(ys) * PX_TO_PT,
-                    "x1": max(xs) * PX_TO_PT,
-                    "y1": max(ys) * PX_TO_PT,
-                })
+            blocks.append({
+                "text": block_text,
+                "x0": max(0, min(xs) - 1) * PX_TO_PT,
+                "y0": max(0, min(ys) - 1) * PX_TO_PT,
+                "x1": (max(xs) + 1) * PX_TO_PT,
+                "y1": (max(ys) + 1) * PX_TO_PT,
+            })
 
+    print(f"  Vision detected {len(blocks)} blocks")
     return blocks
 
 
@@ -163,15 +165,6 @@ def build_overlay_pdf(
     original_bytes: bytes,
     all_page_data: list[list[dict]],
 ) -> bytes:
-    """
-    Creates a new PDF where each page is expanded vertically to make room,
-    with original page as image on top and English translations overlaid
-    as blue text directly on top of each Japanese block.
-    
-    Strategy: render original as image, then draw blue translation text
-    ON TOP of each block position — Japanese stays visible underneath,
-    English appears as a semi-transparent blue overlay.
-    """
     orig_doc = fitz.open(stream=original_bytes, filetype="pdf")
     new_doc = fitz.open()
 
@@ -180,50 +173,44 @@ def build_overlay_pdf(
         orig_w = orig_page.rect.width
         orig_h = orig_page.rect.height
 
-        # Create new page same size as original
         new_page = new_doc.new_page(width=orig_w, height=orig_h)
 
-        # Step 1: render original page as background image (preserves all original content)
+        # Background: original page as image
         img_bytes, img_w, img_h = page_to_image(orig_page)
         new_page.insert_image(fitz.Rect(0, 0, orig_w, orig_h), stream=img_bytes)
 
-        # Step 2: overlay blue English translations on top
+        # Overlay blue English translations
         for block in blocks:
             translated = block.get("translated_text", "").strip()
             if not translated:
                 continue
 
-            x0, y0, x1, y1 = block["x0"], block["y0"], block["x1"], block["y1"]
-
-            # Clamp to page
-            x0 = max(0, min(x0, orig_w - 2))
-            x1 = max(x0 + 2, min(x1, orig_w))
-            y0 = max(0, min(y0, orig_h - 2))
-            y1 = max(y0 + 2, min(y1, orig_h))
+            x0 = max(0, min(block["x0"], orig_w - 2))
+            y0 = max(0, min(block["y0"], orig_h - 2))
+            x1 = max(x0 + 2, min(block["x1"], orig_w))
+            y1 = max(y0 + 2, min(block["y1"], orig_h))
 
             rect = fitz.Rect(x0, y0, x1, y1)
             if rect.width < 4 or rect.height < 4 or rect.is_empty:
                 continue
 
-            # Draw white background using a shape with opacity support
+            # Semi-transparent white background using shape (supports opacity)
             shape = new_page.new_shape()
             shape.draw_rect(rect)
             shape.finish(
                 color=(1, 1, 1),
                 fill=(1, 1, 1),
-                fill_opacity=0.6,  # semi-transparent so Japanese shows through
+                fill_opacity=0.65,
                 stroke_opacity=0,
             )
             shape.commit()
 
-            # Blue English text on top
             fontsize = max(5, min(rect.height * 0.70, 10))
             new_page.insert_textbox(
-                rect,
-                translated,
+                rect, translated,
                 fontsize=fontsize,
                 fontname="helv",
-                color=(0.0, 0.15, 0.75),  # blue
+                color=(0.0, 0.15, 0.75),
                 align=0,
             )
 
